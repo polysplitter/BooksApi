@@ -42,6 +42,8 @@ namespace Books.Controllers
                 return NotFound();
             }
 
+            var bookCover = await _booksRepository.GetBookCoverAsync("dummycover");
+
             return Ok(bookEntity);
         }
 
