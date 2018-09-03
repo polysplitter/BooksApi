@@ -2,11 +2,13 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using Books.Contexts;
 using Books.Entities;
 using Books.ExternalModels;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
 namespace Books.Services
@@ -18,11 +20,15 @@ namespace Books.Services
     {
         private BooksContext _context;
         private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ILogger<BooksRepository> _logger;
+        private CancellationTokenSource _cancellationTokenSource;
 
-        public BooksRepository(BooksContext context, IHttpClientFactory httpClientFactory)
+        public BooksRepository(BooksContext context, IHttpClientFactory httpClientFactory,
+            ILogger<BooksRepository> logger)
         {
-            _context = context ?? throw new ArgumentException(nameof(context));
+            _context = context ?? throw new ArgumentNullException(nameof(context));
             _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         /// <summary>
@@ -79,10 +85,16 @@ namespace Books.Services
             return null;
         }
 
+        /// <summary>
+        /// get a list of book covers in an async fashion.
+        /// </summary>
+        /// <param name="bookId"></param>
+        /// <returns></returns>
         public async Task<IEnumerable<BookCover>> GetBookCoversAsync(Guid bookId)
         {
             var httpClient = _httpClientFactory.CreateClient();
             var bookCovers = new List<BookCover>();
+            _cancellationTokenSource = new CancellationTokenSource();
 
             // create a list of fake bookcovers
             var bookCoverUrls = new[]
@@ -94,19 +106,34 @@ namespace Books.Services
                 $"http://localhost:52644/api/bookcovers/{bookId}-dummycover5",
             };
 
-            foreach (var bookCoverUrl in bookCoverUrls)
+            // create the tasks
+            var downloadBookCoverTasksQuery =
+                from bookCoverUrl
+                in bookCoverUrls
+                select DownloadBookCoverAsync(httpClient, bookCoverUrl, _cancellationTokenSource.Token);
+
+            // start the tasks
+            var downloadBookCoverTasks = downloadBookCoverTasksQuery.ToList();
+
+            try
             {
-                var response = await httpClient
-                    .GetAsync(bookCoverUrl);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    bookCovers.Add(JsonConvert.DeserializeObject<BookCover>(
-                        await response.Content.ReadAsStringAsync()));
-                }
+                return await Task.WhenAll(downloadBookCoverTasks);
             }
+            catch (OperationCanceledException operationCanceledException)
+            {
+                _logger.LogInformation($"{operationCanceledException.Message}");
+                foreach(var task in downloadBookCoverTasks)
+                {
+                    _logger.LogInformation($"Task {task.Id} has status {task.Status}");
+                }
 
-            return bookCovers;
+                return new List<BookCover>();
+            }
+            catch(Exception exception)
+            {
+                _logger.LogError($"{exception.Message}");
+                throw;
+            }
         }
 
         /// <summary>
@@ -144,6 +171,25 @@ namespace Books.Services
             return (await _context.SaveChangesAsync() > 0);
         }
 
+        private async Task<BookCover> DownloadBookCoverAsync(
+            HttpClient httpClient, string bookCoverUrl, CancellationToken cancellationToken)
+        {
+
+            var response = await httpClient
+                .GetAsync(bookCoverUrl, cancellationToken);
+
+            if (response.IsSuccessStatusCode)
+            {
+                var bookCover = JsonConvert.DeserializeObject<BookCover>(
+                    await response.Content.ReadAsStringAsync());
+                return bookCover;
+            }
+
+            _cancellationTokenSource.Cancel();
+
+            return null;
+        }
+
         public void Dispose()
         {
             Dispose(true);
@@ -159,6 +205,11 @@ namespace Books.Services
                 {
                     _context.Dispose();
                     _context = null;
+                }
+                if(_cancellationTokenSource != null)
+                {
+                    _cancellationTokenSource.Dispose();
+                    _cancellationTokenSource = null;
                 }
             }
         }
